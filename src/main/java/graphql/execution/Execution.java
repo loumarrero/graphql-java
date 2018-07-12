@@ -4,17 +4,26 @@ package graphql.execution;
 import graphql.ExecutionInput;
 import graphql.ExecutionResult;
 import graphql.ExecutionResultImpl;
+import graphql.GraphQL;
+import graphql.GraphQLError;
 import graphql.Internal;
-import graphql.MutationNotSupportedError;
+import graphql.execution.defer.DeferSupport;
 import graphql.execution.instrumentation.Instrumentation;
 import graphql.execution.instrumentation.InstrumentationContext;
 import graphql.execution.instrumentation.InstrumentationState;
-import graphql.execution.instrumentation.parameters.InstrumentationDataFetchParameters;
+import graphql.execution.instrumentation.parameters.InstrumentationExecuteOperationParameters;
+import graphql.execution.instrumentation.parameters.InstrumentationExecutionParameters;
 import graphql.language.Document;
 import graphql.language.Field;
+import graphql.language.FragmentDefinition;
+import graphql.language.NodeUtil;
 import graphql.language.OperationDefinition;
+import graphql.language.VariableDefinition;
 import graphql.schema.GraphQLObjectType;
 import graphql.schema.GraphQLSchema;
+import org.reactivestreams.Publisher;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.Collections;
 import java.util.List;
@@ -22,6 +31,7 @@ import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 
 import static graphql.Assert.assertShouldNeverHappen;
+import static graphql.execution.ExecutionContextBuilder.newExecutionContextBuilder;
 import static graphql.execution.ExecutionStrategyParameters.newParameters;
 import static graphql.execution.ExecutionTypeInfo.newTypeInfo;
 import static graphql.language.OperationDefinition.Operation.MUTATION;
@@ -31,6 +41,7 @@ import static java.util.concurrent.CompletableFuture.completedFuture;
 
 @Internal
 public class Execution {
+    private static final Logger log = LoggerFactory.getLogger(Execution.class);
 
     private final FieldCollector fieldCollector = new FieldCollector();
     private final ExecutionStrategy queryStrategy;
@@ -47,8 +58,25 @@ public class Execution {
 
     public CompletableFuture<ExecutionResult> execute(Document document, GraphQLSchema graphQLSchema, ExecutionId executionId, ExecutionInput executionInput, InstrumentationState instrumentationState) {
 
-        ExecutionContext executionContext = new ExecutionContextBuilder()
-                .valuesResolver(new ValuesResolver())
+        NodeUtil.GetOperationResult getOperationResult = NodeUtil.getOperation(document, executionInput.getOperationName());
+        Map<String, FragmentDefinition> fragmentsByName = getOperationResult.fragmentsByName;
+        OperationDefinition operationDefinition = getOperationResult.operationDefinition;
+
+        ValuesResolver valuesResolver = new ValuesResolver();
+        Map<String, Object> inputVariables = executionInput.getVariables();
+        List<VariableDefinition> variableDefinitions = operationDefinition.getVariableDefinitions();
+
+        Map<String, Object> coercedVariables;
+        try {
+            coercedVariables = valuesResolver.coerceArgumentValues(graphQLSchema, variableDefinitions, inputVariables);
+        } catch (RuntimeException rte) {
+            if (rte instanceof GraphQLError) {
+                return completedFuture(new ExecutionResultImpl((GraphQLError) rte));
+            }
+            throw rte;
+        }
+
+        ExecutionContext executionContext = newExecutionContextBuilder()
                 .instrumentation(instrumentation)
                 .instrumentationState(instrumentationState)
                 .executionId(executionId)
@@ -58,27 +86,41 @@ public class Execution {
                 .subscriptionStrategy(subscriptionStrategy)
                 .context(executionInput.getContext())
                 .root(executionInput.getRoot())
+                .fragmentsByName(fragmentsByName)
+                .variables(coercedVariables)
                 .document(document)
-                .operationName(executionInput.getOperationName())
-                .variables(executionInput.getVariables())
+                .operationDefinition(operationDefinition)
                 .build();
-        return executeOperation(executionContext, executionInput.getRoot(), executionContext.getOperationDefinition());
+
+
+        InstrumentationExecutionParameters parameters = new InstrumentationExecutionParameters(
+                executionInput, graphQLSchema, instrumentationState
+        );
+        executionContext = instrumentation.instrumentExecutionContext(executionContext, parameters);
+        return executeOperation(executionContext, parameters, executionInput.getRoot(), executionContext.getOperationDefinition());
     }
 
-    private CompletableFuture<ExecutionResult> executeOperation(ExecutionContext executionContext, Object root, OperationDefinition operationDefinition) {
 
-        InstrumentationContext<ExecutionResult> dataFetchCtx = instrumentation.beginDataFetch(new InstrumentationDataFetchParameters(executionContext));
+    private CompletableFuture<ExecutionResult> executeOperation(ExecutionContext executionContext, InstrumentationExecutionParameters instrumentationExecutionParameters, Object root, OperationDefinition operationDefinition) {
+
+        InstrumentationExecuteOperationParameters instrumentationParams = new InstrumentationExecuteOperationParameters(executionContext);
+        InstrumentationContext<ExecutionResult> executeOperationCtx = instrumentation.beginExecuteOperation(instrumentationParams);
 
         OperationDefinition.Operation operation = operationDefinition.getOperation();
-        GraphQLObjectType operationRootType = getOperationRootType(executionContext.getGraphQLSchema(), operation);
+        GraphQLObjectType operationRootType;
 
-        //
-        // do we have a mutation operation root type.  The spec says if we don't then mutations are not allowed to be executed
-        //
-        // for the record earlier code has asserted that we have a query type in the schema since the spec says this is
-        // ALWAYS required
-        if (operation == MUTATION && operationRootType == null) {
-            return completedFuture(new ExecutionResultImpl(Collections.singletonList(new MutationNotSupportedError())));
+        try {
+            operationRootType = getOperationRootType(executionContext.getGraphQLSchema(), operationDefinition);
+        } catch (RuntimeException rte) {
+            if (rte instanceof GraphQLError) {
+                ExecutionResult executionResult = new ExecutionResultImpl(Collections.singletonList((GraphQLError) rte));
+                CompletableFuture<ExecutionResult> resultCompletableFuture = completedFuture(executionResult);
+
+                executeOperationCtx.onDispatched(resultCompletableFuture);
+                executeOperationCtx.onCompleted(executionResult, rte);
+                return resultCompletableFuture;
+            }
+            throw rte;
         }
 
         FieldCollectorParameters collectorParameters = FieldCollectorParameters.newParameters()
@@ -104,13 +146,16 @@ public class Execution {
 
         CompletableFuture<ExecutionResult> result;
         try {
+            ExecutionStrategy executionStrategy;
             if (operation == OperationDefinition.Operation.MUTATION) {
-                result = mutationStrategy.execute(executionContext, parameters);
+                executionStrategy = mutationStrategy;
             } else if (operation == SUBSCRIPTION) {
-                result = subscriptionStrategy.execute(executionContext, parameters);
+                executionStrategy = subscriptionStrategy;
             } else {
-                result = queryStrategy.execute(executionContext, parameters);
+                executionStrategy = queryStrategy;
             }
+            log.debug("Executing '{}' query operation: '{}' using '{}' execution strategy", executionContext.getExecutionId(), operation, executionStrategy.getClass().getName());
+            result = executionStrategy.execute(executionContext, parameters);
         } catch (NonNullableFieldWasNullException e) {
             // this means it was non null types all the way from an offending non null type
             // up to the root object type and there was a a null value some where.
@@ -122,18 +167,53 @@ public class Execution {
             result = completedFuture(new ExecutionResultImpl(null, executionContext.getErrors()));
         }
 
-        result = result.whenComplete(dataFetchCtx::onEnd);
+        // note this happens NOW - not when the result completes
+        executeOperationCtx.onDispatched(result);
 
-        return result;
+        result = result.whenComplete(executeOperationCtx::onCompleted);
+
+        return deferSupport(executionContext, result);
     }
 
-    private GraphQLObjectType getOperationRootType(GraphQLSchema graphQLSchema, OperationDefinition.Operation operation) {
+    /*
+     * Adds the deferred publisher if its needed at the end of the query.  This is also a good time for the deferred code to start running
+     */
+    private CompletableFuture<ExecutionResult> deferSupport(ExecutionContext executionContext, CompletableFuture<ExecutionResult> result) {
+        return result.thenApply(er -> {
+            DeferSupport deferSupport = executionContext.getDeferSupport();
+            if (deferSupport.isDeferDetected()) {
+                // we start the rest of the query now to maximize throughput.  We have the initial important results
+                // and now we can start the rest of the calls as early as possible (even before some one subscribes)
+                Publisher<ExecutionResult> publisher = deferSupport.startDeferredCalls();
+                return ExecutionResultImpl.newExecutionResult().from((ExecutionResultImpl) er)
+                        .addExtension(GraphQL.DEFERRED_RESULTS, publisher)
+                        .build();
+            }
+            return er;
+        });
+
+    }
+
+    private GraphQLObjectType getOperationRootType(GraphQLSchema graphQLSchema, OperationDefinition operationDefinition) {
+        OperationDefinition.Operation operation = operationDefinition.getOperation();
         if (operation == MUTATION) {
-            return graphQLSchema.getMutationType();
+            GraphQLObjectType mutationType = graphQLSchema.getMutationType();
+            if (mutationType == null) {
+                throw new MissingRootTypeException("Schema is not configured for mutations.", operationDefinition.getSourceLocation());
+            }
+            return mutationType;
         } else if (operation == QUERY) {
-            return graphQLSchema.getQueryType();
+            GraphQLObjectType queryType = graphQLSchema.getQueryType();
+            if (queryType == null) {
+                throw new MissingRootTypeException("Schema does not define the required query root type.", operationDefinition.getSourceLocation());
+            }
+            return queryType;
         } else if (operation == SUBSCRIPTION) {
-            return graphQLSchema.getSubscriptionType();
+            GraphQLObjectType subscriptionType = graphQLSchema.getSubscriptionType();
+            if (subscriptionType == null) {
+                throw new MissingRootTypeException("Schema is not configured for subscriptions.", operationDefinition.getSourceLocation());
+            }
+            return subscriptionType;
         } else {
             return assertShouldNeverHappen("Unhandled case.  An extra operation enum has been added without code support");
         }

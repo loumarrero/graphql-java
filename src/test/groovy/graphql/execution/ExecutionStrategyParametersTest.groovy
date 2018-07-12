@@ -2,9 +2,9 @@ package graphql.execution
 
 import spock.lang.Specification
 
+import static ExecutionTypeInfo.newTypeInfo
 import static graphql.Scalars.GraphQLString
 import static graphql.execution.ExecutionStrategyParameters.newParameters
-import static ExecutionTypeInfo.newTypeInfo
 
 class ExecutionStrategyParametersTest extends Specification {
 
@@ -20,11 +20,11 @@ class ExecutionStrategyParametersTest extends Specification {
         def newParameters = parameters.transform { it -> it.source(123) }
 
         then:
-        newParameters.typeInfo() == parameters.typeInfo()
-        newParameters.fields() == parameters.fields()
+        newParameters.getTypeInfo() == parameters.getTypeInfo()
+        newParameters.getFields() == parameters.getFields()
 
-        newParameters.source() != parameters.source()
-        newParameters.source() == 123
+        newParameters.getSource() != parameters.getSource()
+        newParameters.getSource() == 123
     }
 
 }

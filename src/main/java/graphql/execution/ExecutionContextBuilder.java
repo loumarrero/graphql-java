@@ -1,20 +1,25 @@
 package graphql.execution;
 
+import graphql.GraphQLError;
+import graphql.Internal;
+import graphql.PublicApi;
 import graphql.execution.instrumentation.Instrumentation;
 import graphql.execution.instrumentation.InstrumentationState;
 import graphql.language.Document;
 import graphql.language.FragmentDefinition;
-import graphql.language.NodeUtil;
 import graphql.language.OperationDefinition;
 import graphql.schema.GraphQLSchema;
 
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 import static graphql.Assert.assertNotNull;
 
+@PublicApi
 public class ExecutionContextBuilder {
 
-    private ValuesResolver valuesResolver;
     private Instrumentation instrumentation;
     private ExecutionId executionId;
     private InstrumentationState instrumentationState;
@@ -25,12 +30,49 @@ public class ExecutionContextBuilder {
     private Object context;
     private Object root;
     private Document document;
-    private String operationName;
-    private Map<String, Object> variables;
+    private OperationDefinition operationDefinition;
+    private Map<String, Object> variables = new HashMap<>();
+    private Map<String, FragmentDefinition> fragmentsByName = new HashMap<>();
+    private List<GraphQLError> errors = new ArrayList<>();
 
-    public ExecutionContextBuilder valuesResolver(ValuesResolver valuesResolver) {
-        this.valuesResolver = valuesResolver;
-        return this;
+    /**
+     * @return a new builder of {@link graphql.execution.ExecutionContext}s
+     */
+    public static ExecutionContextBuilder newExecutionContextBuilder() {
+        return new ExecutionContextBuilder();
+    }
+
+    /**
+     * Creates a new builder based on a previous execution context
+     *
+     * @param other the previous execution to clone
+     *
+     * @return a new builder of {@link graphql.execution.ExecutionContext}s
+     */
+    public static ExecutionContextBuilder newExecutionContextBuilder(ExecutionContext other) {
+        return new ExecutionContextBuilder(other);
+    }
+
+    @Internal
+    public ExecutionContextBuilder() {
+    }
+
+    @Internal
+    ExecutionContextBuilder(ExecutionContext other) {
+        instrumentation = other.getInstrumentation();
+        executionId = other.getExecutionId();
+        instrumentationState = other.getInstrumentationState();
+        graphQLSchema = other.getGraphQLSchema();
+        queryStrategy = other.getQueryStrategy();
+        mutationStrategy = other.getMutationStrategy();
+        subscriptionStrategy = other.getSubscriptionStrategy();
+        context = other.getContext();
+        root = other.getRoot();
+        document = other.getDocument();
+        operationDefinition = other.getOperationDefinition();
+        variables = new HashMap<>(other.getVariables());
+        fragmentsByName = new HashMap<>(other.getFragmentsByName());
+        errors = new ArrayList<>(other.getErrors());
     }
 
     public ExecutionContextBuilder instrumentation(Instrumentation instrumentation) {
@@ -78,30 +120,30 @@ public class ExecutionContextBuilder {
         return this;
     }
 
-    public ExecutionContextBuilder document(Document document) {
-        this.document = document;
-        return this;
-    }
-
-    public ExecutionContextBuilder operationName(String operationName) {
-        this.operationName = operationName;
-        return this;
-    }
-
     public ExecutionContextBuilder variables(Map<String, Object> variables) {
         this.variables = variables;
         return this;
     }
 
+    public ExecutionContextBuilder fragmentsByName(Map<String, FragmentDefinition> fragmentsByName) {
+        this.fragmentsByName = fragmentsByName;
+        return this;
+    }
+
+    public ExecutionContextBuilder document(Document document) {
+        this.document = document;
+        return this;
+    }
+
+    public ExecutionContextBuilder operationDefinition(OperationDefinition operationDefinition) {
+        this.operationDefinition = operationDefinition;
+        return this;
+    }
+
+
     public ExecutionContext build() {
         // preconditions
         assertNotNull(executionId, "You must provide a query identifier");
-
-        NodeUtil.GetOperationResult getOperationResult = NodeUtil.getOperation(document, operationName);
-        Map<String, FragmentDefinition> fragmentsByName = getOperationResult.fragmentsByName;
-        OperationDefinition operationDefinition = getOperationResult.operationDefinition;
-
-        Map<String, Object> variableValues = valuesResolver.getVariableValues(graphQLSchema, operationDefinition.getVariableDefinitions(), variables);
 
         return new ExecutionContext(
                 instrumentation,
@@ -112,9 +154,11 @@ public class ExecutionContextBuilder {
                 mutationStrategy,
                 subscriptionStrategy,
                 fragmentsByName,
+                document,
                 operationDefinition,
-                variableValues,
+                variables,
                 context,
-                root);
+                root,
+                errors);
     }
 }

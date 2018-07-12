@@ -1,51 +1,32 @@
 package graphql.schema;
 
 
+import graphql.Assert;
 import graphql.AssertException;
-import graphql.GraphQLException;
 import graphql.Internal;
 import graphql.introspection.Introspection;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import static graphql.schema.GraphQLTypeUtil.isList;
+import static graphql.schema.GraphQLTypeUtil.isNonNull;
+import static graphql.schema.GraphQLTypeUtil.unwrapOne;
 import static java.lang.String.format;
 
 @Internal
 public class SchemaUtil {
 
-    public boolean isLeafType(GraphQLType type) {
-        GraphQLUnmodifiedType unmodifiedType = getUnmodifiedType(type);
-        return
-                unmodifiedType instanceof GraphQLScalarType
-                        || unmodifiedType instanceof GraphQLEnumType;
-    }
-
-    public boolean isInputType(GraphQLType graphQLType) {
-        GraphQLUnmodifiedType unmodifiedType = getUnmodifiedType(graphQLType);
-        return
-                unmodifiedType instanceof GraphQLScalarType
-                        || unmodifiedType instanceof GraphQLEnumType
-                        || unmodifiedType instanceof GraphQLInputObjectType;
-    }
-
-    public GraphQLUnmodifiedType getUnmodifiedType(GraphQLType graphQLType) {
-        if (graphQLType instanceof GraphQLModifiedType) {
-            return getUnmodifiedType(((GraphQLModifiedType) graphQLType).getWrappedType());
-        }
-        return (GraphQLUnmodifiedType) graphQLType;
-    }
-
-
     @SuppressWarnings("StatementWithEmptyBody")
     private void collectTypes(GraphQLType root, Map<String, GraphQLType> result) {
-        if (root instanceof GraphQLNonNull) {
-            collectTypes(((GraphQLNonNull) root).getWrappedType(), result);
-        } else if (root instanceof GraphQLList) {
-            collectTypes(((GraphQLList) root).getWrappedType(), result);
+        if (isNonNull(root)) {
+            collectTypes(unwrapOne(root), result);
+        } else if (isList(root)) {
+            collectTypes(unwrapOne(root), result);
         } else if (root instanceof GraphQLEnumType) {
             assertTypeUniqueness(root, result);
             result.put(root.getName(), root);
@@ -63,7 +44,7 @@ public class SchemaUtil {
         } else if (root instanceof GraphQLTypeReference) {
             // nothing to do
         } else {
-            throw new RuntimeException("Unknown type " + root);
+            Assert.assertShouldNeverHappen("Unknown type %s", root);
         }
     }
 
@@ -150,7 +131,7 @@ public class SchemaUtil {
     }
 
 
-    public Map<String, GraphQLType> allTypes(GraphQLSchema schema, Set<GraphQLType> additionalTypes) {
+    Map<String, GraphQLType> allTypes(GraphQLSchema schema, Set<GraphQLType> additionalTypes) {
         Map<String, GraphQLType> typesByName = new LinkedHashMap<>();
         collectTypes(schema.getQueryType(), typesByName);
         if (schema.isSupportingMutations()) {
@@ -168,22 +149,64 @@ public class SchemaUtil {
         return typesByName;
     }
 
+    /*
+     * Indexes GraphQLObject types registered with the provided schema by implemented GraphQLInterface name
+     *
+     * This helps in accelerates/simplifies collecting types that implement a certain interface
+     *
+     * Provided to replace {@link #findImplementations(graphql.schema.GraphQLSchema, graphql.schema.GraphQLInterfaceType)}
+     * 
+     */
+    Map<String, List<GraphQLObjectType>> groupImplementations(GraphQLSchema schema) {
+        Map<String, List<GraphQLObjectType>> result = new HashMap<>();
+        for (GraphQLType type : schema.getAllTypesAsList()) {
+            if (type instanceof GraphQLObjectType) {
+                for (GraphQLOutputType interfaceType : ((GraphQLObjectType) type).getInterfaces()) {
+                    List<GraphQLObjectType> myGroup = result.computeIfAbsent(interfaceType.getName(), k -> new ArrayList<>());
+                    myGroup.add((GraphQLObjectType) type);
+                }
+            }
+        }
+
+        return result;
+    }
+
+    /**
+     * This method is deprecated due to a performance concern.
+     *
+     * The Algorithm complexity: O(n^2), where n is number of registered GraphQLTypes
+     *
+     * That indexing operation is performed twice per input document:
+     * 1. during validation
+     * 2. during execution
+     *
+     * We now indexed all types at the schema creation, which has brought complexity down to O(1)
+     *
+     * @param schema        GraphQL schema
+     * @param interfaceType an interface type to find implementations for
+     *
+     * @return List of object types implementing provided interface
+     *
+     * @deprecated use {@link graphql.schema.GraphQLSchema#getImplementations(GraphQLInterfaceType)} instead
+     */
+    @Deprecated
     public List<GraphQLObjectType> findImplementations(GraphQLSchema schema, GraphQLInterfaceType interfaceType) {
-        Map<String, GraphQLType> allTypes = allTypes(schema, schema.getAdditionalTypes());
         List<GraphQLObjectType> result = new ArrayList<>();
-        for (GraphQLType type : allTypes.values()) {
+        for (GraphQLType type : schema.getAllTypesAsList()) {
             if (!(type instanceof GraphQLObjectType)) {
                 continue;
             }
             GraphQLObjectType objectType = (GraphQLObjectType) type;
-            if ((objectType).getInterfaces().contains(interfaceType)) result.add(objectType);
+            if ((objectType).getInterfaces().contains(interfaceType)) {
+                result.add(objectType);
+            }
         }
         return result;
     }
 
 
     void replaceTypeReferences(GraphQLSchema schema) {
-        Map<String, GraphQLType> typeMap = allTypes(schema, schema.getAdditionalTypes());
+        Map<String, GraphQLType> typeMap = schema.getTypeMap();
         for (GraphQLType type : typeMap.values()) {
             if (type instanceof GraphQLFieldsContainer) {
                 resolveTypeReferencesForFieldsContainer((GraphQLFieldsContainer) type, typeMap);
@@ -218,15 +241,13 @@ public class SchemaUtil {
     GraphQLType resolveTypeReference(GraphQLType type, Map<String, GraphQLType> typeMap) {
         if (type instanceof GraphQLTypeReference || typeMap.containsKey(type.getName())) {
             GraphQLType resolvedType = typeMap.get(type.getName());
-            if (resolvedType == null) {
-                throw new GraphQLException("type " + type.getName() + " not found in schema");
-            }
+            Assert.assertTrue(resolvedType != null, "type %s not found in schema", type.getName());
             return resolvedType;
         }
-        if (type instanceof GraphQLList) {
+        if (isList(type)) {
             ((GraphQLList) type).replaceTypeReferences(typeMap);
         }
-        if (type instanceof GraphQLNonNull) {
+        if (isNonNull(type)) {
             ((GraphQLNonNull) type).replaceTypeReferences(typeMap);
         }
         return type;

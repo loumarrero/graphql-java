@@ -2,22 +2,32 @@ package graphql
 
 import graphql.analysis.MaxQueryComplexityInstrumentation
 import graphql.analysis.MaxQueryDepthInstrumentation
+import graphql.execution.AsyncExecutionStrategy
+import graphql.execution.ExecutionContext
+import graphql.execution.ExecutionId
+import graphql.execution.ExecutionIdProvider
+import graphql.execution.ExecutionStrategyParameters
+import graphql.execution.MissingRootTypeException
+import graphql.execution.batched.BatchedExecutionStrategy
+import graphql.execution.instrumentation.Instrumentation
+import graphql.execution.instrumentation.SimpleInstrumentation
 import graphql.language.SourceLocation
 import graphql.schema.DataFetcher
 import graphql.schema.DataFetchingEnvironment
 import graphql.schema.GraphQLEnumType
 import graphql.schema.GraphQLFieldDefinition
+import graphql.schema.GraphQLInterfaceType
 import graphql.schema.GraphQLList
 import graphql.schema.GraphQLNonNull
 import graphql.schema.GraphQLObjectType
 import graphql.schema.GraphQLSchema
-import graphql.schema.GraphQLTypeReference
 import graphql.schema.StaticDataFetcher
 import graphql.validation.ValidationError
 import graphql.validation.ValidationErrorType
 import spock.lang.Specification
 import spock.lang.Unroll
 
+import java.util.concurrent.CompletableFuture
 import java.util.function.UnaryOperator
 
 import static graphql.ExecutionInput.Builder
@@ -28,8 +38,10 @@ import static graphql.schema.GraphQLArgument.newArgument
 import static graphql.schema.GraphQLFieldDefinition.newFieldDefinition
 import static graphql.schema.GraphQLInputObjectField.newInputObjectField
 import static graphql.schema.GraphQLInputObjectType.newInputObject
+import static graphql.schema.GraphQLList.list
 import static graphql.schema.GraphQLObjectType.newObject
 import static graphql.schema.GraphQLSchema.newSchema
+import static graphql.schema.GraphQLTypeReference.typeRef
 
 class GraphQLTest extends Specification {
 
@@ -157,7 +169,7 @@ class GraphQLTest extends Specification {
                         .type(GraphQLString)
                         .argument(newArgument()
                         .name("arg")
-                        .type(new GraphQLNonNull(GraphQLString))))
+                        .type(GraphQLNonNull.nonNull(GraphQLString))))
                         .build()
         ).build()
 
@@ -182,7 +194,7 @@ class GraphQLTest extends Specification {
                 .name("QueryType")
                 .field(newFieldDefinition()
                 .name("set")
-                .type(new GraphQLList(GraphQLString))
+                .type(list(GraphQLString))
                 .dataFetcher({ set })))
                 .build()
 
@@ -256,9 +268,25 @@ class GraphQLTest extends Specification {
 
         then:
         result.errors.size() == 1
-        result.errors[0].class == MutationNotSupportedError
+        result.errors[0].class == MissingRootTypeException
     }
 
+    def "#875 a subscription query against a schema that doesn't support subscriptions should result in a GraphQL error"() {
+        given:
+
+        GraphQLSchema schema = newSchema().query(
+                newObject()
+                        .name("Query")
+        )
+                .build()
+
+        when:
+        def result = new GraphQL(schema).execute("subscription { doesNotExist }")
+
+        then:
+        result.errors.size() == 1
+        result.errors[0].class == MissingRootTypeException
+    }
 
     def "query with int literal too large"() {
         given:
@@ -408,7 +436,7 @@ class GraphQLTest extends Specification {
         given:
         def dataFetcher = Mock(DataFetcher)
         def inputObject = newInputObject().name("bar")
-                .field(newInputObjectField().name("list").type(new GraphQLList(GraphQLString)).build())
+                .field(newInputObjectField().name("list").type(list(GraphQLString)).build())
                 .build()
         GraphQLSchema schema = newSchema().query(
                 newObject()
@@ -439,7 +467,7 @@ class GraphQLTest extends Specification {
         given:
         def dataFetcher = Mock(DataFetcher)
         def inputObject = newInputObject().name("bar")
-                .field(newInputObjectField().name("list").type(new GraphQLList(GraphQLString)).build())
+                .field(newInputObjectField().name("list").type(list(GraphQLString)).build())
                 .build()
         GraphQLSchema schema = newSchema().query(
                 newObject()
@@ -471,7 +499,7 @@ class GraphQLTest extends Specification {
         given:
         def dataFetcher = Mock(DataFetcher)
         def inputObject = newInputObject().name("bar")
-                .field(newInputObjectField().name("list").type(new GraphQLList(GraphQLString)).build())
+                .field(newInputObjectField().name("list").type(list(GraphQLString)).build())
                 .build()
         GraphQLSchema schema = newSchema().query(
                 newObject()
@@ -591,7 +619,7 @@ class GraphQLTest extends Specification {
                 .name("Foo")
                 .field(newFieldDefinition()
                 .name("field")
-                .type(new GraphQLTypeReference('Foo'))
+                .type(typeRef('Foo'))
                 .build())
                 .field(newFieldDefinition()
                 .name("scalar")
@@ -607,7 +635,7 @@ class GraphQLTest extends Specification {
                         .build()).build())
                 .build()
 
-        MaxQueryDepthInstrumentation maximumQueryDepthInstrumentation = new MaxQueryDepthInstrumentation(3);
+        MaxQueryDepthInstrumentation maximumQueryDepthInstrumentation = new MaxQueryDepthInstrumentation(3)
 
 
         def graphql = GraphQL.newGraphQL(schema).instrumentation(maximumQueryDepthInstrumentation).build()
@@ -635,7 +663,7 @@ class GraphQLTest extends Specification {
                 .name("Foo")
                 .field(newFieldDefinition()
                 .name("field")
-                .type(new GraphQLTypeReference('Foo'))
+                .type(typeRef('Foo'))
                 .build())
                 .field(newFieldDefinition()
                 .name("scalar")
@@ -651,7 +679,7 @@ class GraphQLTest extends Specification {
                         .build()).build())
                 .build()
 
-        MaxQueryComplexityInstrumentation maxQueryComplexityInstrumentation = new MaxQueryComplexityInstrumentation(3);
+        MaxQueryComplexityInstrumentation maxQueryComplexityInstrumentation = new MaxQueryComplexityInstrumentation(3)
 
 
         def graphql = GraphQL.newGraphQL(schema).instrumentation(maxQueryComplexityInstrumentation).build()
@@ -671,4 +699,226 @@ class GraphQLTest extends Specification {
         "{ f2:field {scalar} f1: field{scalar} f3: field {scalar}}" | _
     }
 
+    @Unroll
+    def "validation error with (#instrumentationName)"() {
+        given:
+        GraphQLObjectType foo = newObject()
+                .name("Foo")
+                .withInterface(typeRef("Node"))
+                .field(
+                { field ->
+                    field
+                            .name("id")
+                            .type(Scalars.GraphQLID)
+                } as UnaryOperator)
+                .build()
+
+        GraphQLInterfaceType node = GraphQLInterfaceType.newInterface()
+                .name("Node")
+                .field(
+                { field ->
+                    field
+                            .name("id")
+                            .type(Scalars.GraphQLID)
+                } as UnaryOperator)
+                .typeResolver({ type -> foo })
+                .build()
+
+        GraphQLObjectType query = newObject()
+                .name("RootQuery")
+                .field(
+                { field ->
+                    field
+                            .name("a")
+                            .type(node)
+                } as UnaryOperator)
+                .build()
+
+        GraphQLSchema schema = newSchema()
+                .query(query)
+                .build()
+
+        GraphQL graphQL = GraphQL.newGraphQL(schema)
+                .instrumentation(instrumentation)
+                .build()
+
+        ExecutionInput executionInput = newExecutionInput()
+                .query("{a}")
+                .build()
+
+        when:
+        def result = graphQL.execute(executionInput)
+
+        then:
+        result.errors.size() == 1
+        result.errors[0].message.contains("Sub selection required")
+
+        where:
+        instrumentationName    | instrumentation
+        'max query depth'      | new MaxQueryDepthInstrumentation(10)
+        'max query complexity' | new MaxQueryComplexityInstrumentation(10)
+    }
+
+
+    def "batched execution with non batched DataFetcher returning CompletableFuture"() {
+        given:
+        GraphQLObjectType foo = newObject()
+                .name("Foo")
+                .withInterface(typeRef("Node"))
+                .field(
+                { field ->
+                    field
+                            .name("id")
+                            .type(Scalars.GraphQLID)
+                } as UnaryOperator)
+                .build()
+
+        GraphQLInterfaceType node = GraphQLInterfaceType.newInterface()
+                .name("Node")
+                .field(
+                { field ->
+                    field
+                            .name("id")
+                            .type(Scalars.GraphQLID)
+                } as UnaryOperator)
+                .typeResolver(
+                {
+                    env ->
+                        if (env.getObject() instanceof CompletableFuture) {
+                            throw new RuntimeException("This seems bad!")
+                        }
+
+                        return foo
+                })
+                .build()
+
+        GraphQLObjectType query = newObject()
+                .name("RootQuery")
+                .field(
+                { field ->
+                    field
+                            .name("node")
+                            .dataFetcher(
+                            { env ->
+                                CompletableFuture.supplyAsync({ ->
+                                    Map<String, String> map = new HashMap<>()
+                                    map.put("id", "abc")
+
+                                    return map
+                                })
+                            })
+                            .type(node)
+                } as UnaryOperator)
+                .build()
+
+        GraphQLSchema schema = newSchema()
+                .query(query)
+                .additionalType(foo)
+                .build()
+
+        GraphQL graphQL = GraphQL.newGraphQL(schema)
+                .queryExecutionStrategy(new BatchedExecutionStrategy())
+                .mutationExecutionStrategy(new BatchedExecutionStrategy())
+                .build()
+
+        ExecutionInput executionInput = newExecutionInput()
+                .query("{node {id}}")
+                .build()
+        when:
+        def result = graphQL
+                .execute(executionInput)
+
+        then:
+        result.getData() == [node: [id: "abc"]]
+    }
+
+    class CaptureStrategy extends AsyncExecutionStrategy {
+        ExecutionId executionId = null
+        Instrumentation instrumentation = null
+
+        @Override
+        CompletableFuture<ExecutionResult> execute(ExecutionContext executionContext, ExecutionStrategyParameters parameters) {
+            executionId = executionContext.executionId
+            instrumentation = executionContext.instrumentation
+            return super.execute(executionContext, parameters)
+        }
+    }
+
+    def "graphql copying works as expected"() {
+
+        def instrumentation = new SimpleInstrumentation()
+        def hello = ExecutionId.from("hello")
+        def executionIdProvider = new ExecutionIdProvider() {
+            @Override
+            ExecutionId provide(String q, String operationName, Object context) {
+                return hello
+            }
+        }
+
+        def queryStrategy = new CaptureStrategy()
+        GraphQL graphQL = GraphQL.newGraphQL(simpleSchema())
+                .queryExecutionStrategy(queryStrategy)
+                .instrumentation(instrumentation)
+                .executionIdProvider(executionIdProvider)
+                .build()
+
+        when:
+        // now copy it as is
+        def newGraphQL = graphQL.transform({ builder -> })
+        def result = newGraphQL.execute('{ hello }').data
+
+        then:
+        result == [hello: 'world']
+        queryStrategy.executionId == hello
+        queryStrategy.instrumentation == instrumentation
+
+        when:
+
+        // now make some changes
+        def newInstrumentation = new SimpleInstrumentation()
+        def goodbye = ExecutionId.from("goodbye")
+        def newExecutionIdProvider = new ExecutionIdProvider() {
+            @Override
+            ExecutionId provide(String q, String operationName, Object context) {
+                return goodbye
+            }
+        }
+
+        newGraphQL = graphQL.transform({ builder ->
+            builder.executionIdProvider(newExecutionIdProvider).instrumentation(newInstrumentation)
+        })
+        result = newGraphQL.execute('{ hello }').data
+
+        then:
+        result == [hello: 'world']
+        queryStrategy.executionId == goodbye
+        queryStrategy.instrumentation == newInstrumentation
+    }
+
+    def "query with triple quoted multi line strings"() {
+        given:
+        GraphQLFieldDefinition.Builder fieldDefinition = newFieldDefinition()
+                .name("hello")
+                .type(GraphQLString)
+                .argument(newArgument().name("arg").type(GraphQLString))
+                .dataFetcher({ env -> env.getArgument("arg") }
+        )
+        GraphQLSchema schema = newSchema().query(
+                newObject()
+                        .name("Query")
+                        .field(fieldDefinition)
+                        .build()
+        ).build()
+
+        when:
+        def result = GraphQL.newGraphQL(schema).build().execute('''{ hello(arg:"""
+world
+over
+many lines""") }''')
+
+        then:
+        result.data == [hello: '''world
+over
+many lines''']
+    }
 }

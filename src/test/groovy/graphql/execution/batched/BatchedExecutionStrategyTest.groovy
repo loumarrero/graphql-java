@@ -7,11 +7,21 @@ package graphql.execution.batched
 import graphql.ExceptionWhileDataFetching
 import graphql.ExecutionResult
 import graphql.GraphQL
+import graphql.Scalars
 import graphql.execution.AsyncExecutionStrategy
+import graphql.execution.NonNullableFieldWasNullError
+import graphql.execution.instrumentation.TestingInstrumentation
+import graphql.schema.DataFetcher
+import graphql.schema.GraphQLObjectType
 import graphql.schema.GraphQLSchema
 import spock.lang.Specification
 
 import java.util.concurrent.atomic.AtomicInteger
+
+import static graphql.schema.GraphQLArgument.newArgument
+import static graphql.schema.GraphQLFieldDefinition.newFieldDefinition
+import static graphql.schema.GraphQLNonNull.nonNull
+import static graphql.schema.GraphQLObjectType.newObject
 
 class BatchedExecutionStrategyTest extends Specification {
 
@@ -26,7 +36,10 @@ class BatchedExecutionStrategyTest extends Specification {
             .build()
 
     private Map<FunWithStringsSchemaFactory.CallType, AtomicInteger> countMap = new HashMap<>()
+    private TestingInstrumentation testingInstrumentation = new TestingInstrumentation()
+
     private GraphQL graphQLBatchedValue = GraphQL.newGraphQL(FunWithStringsSchemaFactory.createBatched(countMap).createSchema())
+            .instrumentation(testingInstrumentation)
             .queryExecutionStrategy(new BatchedExecutionStrategy())
             .build()
 
@@ -63,6 +76,8 @@ class BatchedExecutionStrategyTest extends Specification {
         runTestAsync(query, expected)
         runTestBatchingUnbatched(query, expected)
         runTestBatching(query, expected)
+        // check instrumentation recorded invocations
+        assert !testingInstrumentation.dfInvocations.isEmpty()
     }
 
     private void runTestBatchingUnbatched(String query, Map<String, Object> expected) {
@@ -379,4 +394,87 @@ class BatchedExecutionStrategyTest extends Specification {
         runTestBatching(query, expected)
         runTestBatchingExpectErrors(query, new BatchAssertionFailed(), false)
     }
+
+    def "#673 optional support"() {
+        given:
+        String query = "{ string(value: \"673-optional-support\"){emptyOptional, optional} }"
+
+        def expected = [string: [emptyOptional: null, optional: "673-optional-support"]]
+        println expected
+
+        expect:
+        runTest(query, expected)
+    }
+
+
+    def "Any Iterable is accepted as GraphQL list value"() {
+        given:
+        String query = "{ string(value: \"test\"){ anyIterable } }"
+        Map<String, Object> expected = ["string": ["anyIterable": ["test", "end"]]]
+        expect:
+        runTest(query, expected)
+    }
+
+    def "#672-683 handles completable futures ok"() {
+
+        given:
+        String query = "{ string(value: \"test\"){ completableFuture } }"
+        Map<String, Object> expected = ["string": ["completableFuture": "completableFuture"]]
+        expect:
+        runTest(query, expected)
+    }
+
+    def "#672-683 handles completable futures ok in interfaces"() {
+
+        given:
+        String query = "{ interface { value } }"
+        Map<String, Object> expected = ["interface": ["value": "interfacesHandled"]]
+        expect:
+        runTest(query, expected)
+    }
+
+    def "#684 handles exceptions in DFs"() {
+
+        given:
+        def UserType = newObject()
+                .name("User")
+                .field(newFieldDefinition()
+                .name("id")
+                .type(nonNull(Scalars.GraphQLInt))
+                .dataFetcher(
+                { e -> throw new RuntimeException("Hello") }
+        )).build()
+
+        DataFetcher userDataFetcher = { environment ->
+            if (environment.getArgument("nullArg") == true) {
+                return null
+            }
+            Map<String, Object> user = new HashMap<>()
+            user.put("id", 1)
+            return user
+        }
+        GraphQLObjectType queryObject = newObject().name("Query")
+                .field(newFieldDefinition()
+                .name("user")
+                .type(nonNull(UserType))
+                .argument(newArgument().name("nullArg").type(Scalars.GraphQLBoolean))
+                .dataFetcher(userDataFetcher)
+        ).build()
+
+        GraphQLSchema schema = GraphQLSchema.newSchema()
+                .query(queryObject)
+                .build()
+
+        GraphQL graphQL = GraphQL.newGraphQL(schema)
+                .queryExecutionStrategy(new BatchedExecutionStrategy())
+                .build()
+
+        //ExecutionResult result = graphQL.execute("query { user(nullArg:false) { id } }")
+        ExecutionResult result = graphQL.execute("query { user { id } }")
+
+        expect:
+        result.getErrors().size() == 1
+        result.getErrors()[0] instanceof ExceptionWhileDataFetching
+    }
+
 }

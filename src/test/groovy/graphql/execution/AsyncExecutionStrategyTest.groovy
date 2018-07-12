@@ -1,8 +1,9 @@
 package graphql.execution
 
 import graphql.ErrorType
-import graphql.execution.instrumentation.NoOpInstrumentation
+import graphql.execution.instrumentation.SimpleInstrumentation
 import graphql.language.Field
+import graphql.language.OperationDefinition
 import graphql.parser.Parser
 import graphql.schema.DataFetcher
 import graphql.schema.GraphQLFieldDefinition
@@ -63,6 +64,7 @@ class AsyncExecutionStrategyTest extends Specification {
         )
         String query = "{hello, hello2}"
         def document = new Parser().parseDocument(query)
+        def operation = document.definitions[0] as OperationDefinition
 
         def typeInfo = ExecutionTypeInfo.newTypeInfo()
                 .type(schema.getQueryType())
@@ -71,14 +73,13 @@ class AsyncExecutionStrategyTest extends Specification {
         ExecutionContext executionContext = new ExecutionContextBuilder()
                 .graphQLSchema(schema)
                 .executionId(ExecutionId.generate())
-                .document(document)
-                .valuesResolver(new ValuesResolver())
-                .instrumentation(NoOpInstrumentation.INSTANCE)
+                .operationDefinition(operation)
+                .instrumentation(SimpleInstrumentation.INSTANCE)
                 .build()
         ExecutionStrategyParameters executionStrategyParameters = ExecutionStrategyParameters
                 .newParameters()
                 .typeInfo(typeInfo)
-                .fields(['hello': [new Field('hello')], 'hello2': [new Field('hello2')]])
+                .fields(['hello': [Field.newField('hello').build()], 'hello2': [Field.newField('hello2').build()]])
                 .build()
 
         AsyncExecutionStrategy asyncExecutionStrategy = new AsyncExecutionStrategy()
@@ -101,6 +102,7 @@ class AsyncExecutionStrategyTest extends Specification {
         )
         String query = "{hello, hello2}"
         def document = new Parser().parseDocument(query)
+        def operation = document.definitions[0] as OperationDefinition
 
         def typeInfo = ExecutionTypeInfo.newTypeInfo()
                 .type(schema.getQueryType())
@@ -109,14 +111,13 @@ class AsyncExecutionStrategyTest extends Specification {
         ExecutionContext executionContext = new ExecutionContextBuilder()
                 .graphQLSchema(schema)
                 .executionId(ExecutionId.generate())
-                .document(document)
-                .valuesResolver(new ValuesResolver())
-                .instrumentation(NoOpInstrumentation.INSTANCE)
+                .operationDefinition(operation)
+                .instrumentation(SimpleInstrumentation.INSTANCE)
                 .build()
         ExecutionStrategyParameters executionStrategyParameters = ExecutionStrategyParameters
                 .newParameters()
                 .typeInfo(typeInfo)
-                .fields(['hello': [new Field('hello')], 'hello2': [new Field('hello2')]])
+                .fields(['hello': [Field.newField('hello').build()], 'hello2': [Field.newField('hello2').build()]])
                 .build()
 
         AsyncExecutionStrategy asyncExecutionStrategy = new AsyncExecutionStrategy()
@@ -141,6 +142,7 @@ class AsyncExecutionStrategyTest extends Specification {
         )
         String query = "{hello, hello2}"
         def document = new Parser().parseDocument(query)
+        def operation = document.definitions[0] as OperationDefinition
 
         def typeInfo = ExecutionTypeInfo.newTypeInfo()
                 .type(schema.getQueryType())
@@ -149,14 +151,13 @@ class AsyncExecutionStrategyTest extends Specification {
         ExecutionContext executionContext = new ExecutionContextBuilder()
                 .graphQLSchema(schema)
                 .executionId(ExecutionId.generate())
-                .document(document)
-                .valuesResolver(new ValuesResolver())
-                .instrumentation(NoOpInstrumentation.INSTANCE)
+                .operationDefinition(operation)
+                .instrumentation(SimpleInstrumentation.INSTANCE)
                 .build()
         ExecutionStrategyParameters executionStrategyParameters = ExecutionStrategyParameters
                 .newParameters()
                 .typeInfo(typeInfo)
-                .fields(['hello': [new Field('hello')], 'hello2': [new Field('hello2')]])
+                .fields(['hello': [Field.newField('hello').build()], 'hello2': [Field.newField('hello2').build()]])
                 .build()
 
         AsyncExecutionStrategy asyncExecutionStrategy = new AsyncExecutionStrategy()
@@ -180,6 +181,7 @@ class AsyncExecutionStrategyTest extends Specification {
         )
         String query = "{hello, hello2}"
         def document = new Parser().parseDocument(query)
+        def operation = document.definitions[0] as OperationDefinition
 
         def typeInfo = ExecutionTypeInfo.newTypeInfo()
                 .type(schema.getQueryType())
@@ -188,14 +190,13 @@ class AsyncExecutionStrategyTest extends Specification {
         ExecutionContext executionContext = new ExecutionContextBuilder()
                 .graphQLSchema(schema)
                 .executionId(ExecutionId.generate())
-                .document(document)
-                .valuesResolver(new ValuesResolver())
-                .instrumentation(NoOpInstrumentation.INSTANCE)
+                .operationDefinition(operation)
+                .instrumentation(SimpleInstrumentation.INSTANCE)
                 .build()
         ExecutionStrategyParameters executionStrategyParameters = ExecutionStrategyParameters
                 .newParameters()
                 .typeInfo(typeInfo)
-                .fields(['hello': [new Field('hello')], 'hello2': [new Field('hello2')]])
+                .fields(['hello': [Field.newField('hello').build()], 'hello2': [Field.newField('hello2').build()]])
                 .build()
 
         AsyncExecutionStrategy asyncExecutionStrategy = new AsyncExecutionStrategy()

@@ -4,6 +4,7 @@ import graphql.ExecutionResult;
 import graphql.ExecutionResultImpl;
 import graphql.GraphQLException;
 import graphql.PublicApi;
+import graphql.execution.instrumentation.Instrumentation;
 import graphql.execution.instrumentation.InstrumentationContext;
 import graphql.execution.instrumentation.parameters.InstrumentationExecutionStrategyParameters;
 import graphql.language.Field;
@@ -35,7 +36,7 @@ import java.util.concurrent.Future;
 @PublicApi
 public class ExecutorServiceExecutionStrategy extends ExecutionStrategy {
 
-    ExecutorService executorService;
+    final ExecutorService executorService;
 
     public ExecutorServiceExecutionStrategy(ExecutorService executorService) {
         this(executorService, new SimpleDataFetcherExceptionHandler());
@@ -49,24 +50,30 @@ public class ExecutorServiceExecutionStrategy extends ExecutionStrategy {
 
     @Override
     public CompletableFuture<ExecutionResult> execute(final ExecutionContext executionContext, final ExecutionStrategyParameters parameters) {
-        if (executorService == null)
+        if (executorService == null) {
             return new AsyncExecutionStrategy().execute(executionContext, parameters);
+        }
 
+        Instrumentation instrumentation = executionContext.getInstrumentation();
+        InstrumentationExecutionStrategyParameters instrumentationParameters = new InstrumentationExecutionStrategyParameters(executionContext, parameters);
+        InstrumentationContext<ExecutionResult> executionStrategyCtx = instrumentation.beginExecutionStrategy(instrumentationParameters);
 
-        InstrumentationContext<CompletableFuture<ExecutionResult>> executionStrategyCtx = executionContext.getInstrumentation().beginExecutionStrategy(new InstrumentationExecutionStrategyParameters(executionContext));
-
-        Map<String, List<Field>> fields = parameters.fields();
+        Map<String, List<Field>> fields = parameters.getFields();
         Map<String, Future<CompletableFuture<ExecutionResult>>> futures = new LinkedHashMap<>();
         for (String fieldName : fields.keySet()) {
             final List<Field> currentField = fields.get(fieldName);
 
-            ExecutionPath fieldPath = parameters.path().segment(fieldName);
+            ExecutionPath fieldPath = parameters.getPath().segment(fieldName);
             ExecutionStrategyParameters newParameters = parameters
                     .transform(builder -> builder.field(currentField).path(fieldPath));
 
             Callable<CompletableFuture<ExecutionResult>> resolveField = () -> resolveField(executionContext, newParameters);
             futures.put(fieldName, executorService.submit(resolveField));
         }
+
+        CompletableFuture<ExecutionResult> overallResult = new CompletableFuture<>();
+        executionStrategyCtx.onDispatched(overallResult);
+
         try {
             Map<String, Object> results = new LinkedHashMap<>();
             for (String fieldName : futures.keySet()) {
@@ -84,11 +91,14 @@ public class ExecutorServiceExecutionStrategy extends ExecutionStrategy {
                 }
                 results.put(fieldName, executionResult != null ? executionResult.getData() : null);
             }
-            CompletableFuture<ExecutionResult> result = CompletableFuture.completedFuture(new ExecutionResultImpl(results, executionContext.getErrors()));
-            executionStrategyCtx.onEnd(result, null);
-            return result;
+
+            ExecutionResultImpl executionResult = new ExecutionResultImpl(results, executionContext.getErrors());
+            overallResult.complete(executionResult);
+
+            overallResult = overallResult.whenComplete(executionStrategyCtx::onCompleted);
+            return overallResult;
         } catch (InterruptedException | ExecutionException e) {
-            executionStrategyCtx.onEnd(null, e);
+            executionStrategyCtx.onCompleted(null, e);
             throw new GraphQLException(e);
         }
     }

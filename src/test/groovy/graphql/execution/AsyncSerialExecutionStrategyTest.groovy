@@ -1,7 +1,8 @@
 package graphql.execution
 
-import graphql.execution.instrumentation.NoOpInstrumentation
+import graphql.execution.instrumentation.SimpleInstrumentation
 import graphql.language.Field
+import graphql.language.OperationDefinition
 import graphql.parser.Parser
 import graphql.schema.DataFetcher
 import graphql.schema.GraphQLFieldDefinition
@@ -70,6 +71,7 @@ class AsyncSerialExecutionStrategyTest extends Specification {
         )
         String query = "{hello, hello2, hello3}"
         def document = new Parser().parseDocument(query)
+        def operation = document.definitions[0] as OperationDefinition
 
         def typeInfo = ExecutionTypeInfo.newTypeInfo()
                 .type(schema.getQueryType())
@@ -78,9 +80,8 @@ class AsyncSerialExecutionStrategyTest extends Specification {
         ExecutionContext executionContext = new ExecutionContextBuilder()
                 .graphQLSchema(schema)
                 .executionId(ExecutionId.generate())
-                .document(document)
-                .valuesResolver(new ValuesResolver())
-                .instrumentation(NoOpInstrumentation.INSTANCE)
+                .operationDefinition(operation)
+                .instrumentation(SimpleInstrumentation.INSTANCE)
                 .build()
         ExecutionStrategyParameters executionStrategyParameters = ExecutionStrategyParameters
                 .newParameters()
@@ -98,6 +99,7 @@ class AsyncSerialExecutionStrategyTest extends Specification {
         result.get().data == ['hello': 'world1', 'hello2': 'world2', 'hello3': 'world3']
     }
 
+    @SuppressWarnings("GroovyAssignabilityCheck")
     def "async serial execution test"() {
         given:
         def df1 = Mock(DataFetcher)
@@ -112,6 +114,7 @@ class AsyncSerialExecutionStrategyTest extends Specification {
         GraphQLSchema schema = schema(df1, df2, df3)
         String query = "{hello, hello2, hello3}"
         def document = new Parser().parseDocument(query)
+        def operation = document.definitions[0] as OperationDefinition
 
         def typeInfo = ExecutionTypeInfo.newTypeInfo()
                 .type(schema.getQueryType())
@@ -120,9 +123,8 @@ class AsyncSerialExecutionStrategyTest extends Specification {
         ExecutionContext executionContext = new ExecutionContextBuilder()
                 .graphQLSchema(schema)
                 .executionId(ExecutionId.generate())
-                .document(document)
-                .valuesResolver(new ValuesResolver())
-                .instrumentation(NoOpInstrumentation.INSTANCE)
+                .operationDefinition(operation)
+                .instrumentation(SimpleInstrumentation.INSTANCE)
                 .build()
         ExecutionStrategyParameters executionStrategyParameters = ExecutionStrategyParameters
                 .newParameters()

@@ -1,13 +1,16 @@
 package graphql.execution
 
 import graphql.Assert
+import graphql.DataFetchingErrorGraphQLError
 import graphql.ExceptionWhileDataFetching
 import graphql.ExecutionResult
 import graphql.Scalars
 import graphql.SerializationError
-import graphql.execution.instrumentation.NoOpInstrumentation
+import graphql.TypeMismatchError
+import graphql.execution.instrumentation.SimpleInstrumentation
 import graphql.language.Argument
 import graphql.language.Field
+import graphql.language.OperationDefinition
 import graphql.language.SourceLocation
 import graphql.language.StringValue
 import graphql.parser.Parser
@@ -16,7 +19,6 @@ import graphql.schema.DataFetcher
 import graphql.schema.DataFetchingEnvironment
 import graphql.schema.GraphQLEnumType
 import graphql.schema.GraphQLFieldDefinition
-import graphql.schema.GraphQLList
 import graphql.schema.GraphQLScalarType
 import graphql.schema.GraphQLSchema
 import spock.lang.Specification
@@ -29,6 +31,7 @@ import static graphql.Scalars.GraphQLString
 import static graphql.schema.GraphQLArgument.newArgument
 import static graphql.schema.GraphQLEnumType.newEnum
 import static graphql.schema.GraphQLFieldDefinition.newFieldDefinition
+import static graphql.schema.GraphQLList.list
 import static graphql.schema.GraphQLNonNull.nonNull
 import static graphql.schema.GraphQLObjectType.newObject
 
@@ -52,9 +55,13 @@ class ExecutionStrategyTest extends Specification {
     def buildContext(GraphQLSchema schema = null) {
         ExecutionId executionId = ExecutionId.from("executionId123")
         def variables = [arg1: "value1"]
-        new ExecutionContext(NoOpInstrumentation.INSTANCE, executionId, schema, null, executionStrategy, executionStrategy, executionStrategy, null, null, variables, "context", "root")
+        new ExecutionContext(SimpleInstrumentation.INSTANCE, executionId, schema, null,
+                executionStrategy, executionStrategy, executionStrategy,
+                null, null, null,
+                variables, "context", "root")
     }
 
+    @SuppressWarnings("GroovyAssignabilityCheck")
     def "complete values always calls query strategy to execute more"() {
         given:
         def dataFetcher = Mock(DataFetcher)
@@ -68,23 +75,26 @@ class ExecutionStrategyTest extends Specification {
                 .field(fieldDefinition)
                 .build()
 
+        def document = new Parser().parseDocument("{someField}")
+        def operation = document.definitions[0] as OperationDefinition
+
         GraphQLSchema schema = GraphQLSchema.newSchema().query(objectType).build()
         def builder = new ExecutionContextBuilder()
         builder.queryStrategy(Mock(ExecutionStrategy))
         builder.mutationStrategy(Mock(ExecutionStrategy))
         builder.subscriptionStrategy(Mock(ExecutionStrategy))
         builder.graphQLSchema(schema)
-        builder.document(new Parser().parseDocument("{someField}"))
+
+        builder.operationDefinition(operation)
         builder.executionId(ExecutionId.generate())
-        builder.valuesResolver(new ValuesResolver())
 
         def executionContext = builder.build()
         def result = new Object()
         def parameters = newParameters()
                 .typeInfo(ExecutionTypeInfo.newTypeInfo().type(objectType))
                 .source(result)
-                .fields(["fld": [new Field()]])
-                .field([new Field()])
+                .fields(["fld": [Field.newField().build()]])
+                .field([Field.newField().build()])
                 .build()
 
         when:
@@ -100,16 +110,22 @@ class ExecutionStrategyTest extends Specification {
     def "completes value for a java.util.List"() {
         given:
         ExecutionContext executionContext = buildContext()
-        def fieldType = new GraphQLList(GraphQLString)
+        def fieldType = list(GraphQLString)
+        def fldDef = newFieldDefinition().name("test").type(fieldType).build()
+        def typeInfo = ExecutionTypeInfo.newTypeInfo().type(fieldType).fieldDefinition(fldDef).build()
+        NonNullableFieldValidator nullableFieldValidator = new NonNullableFieldValidator(executionContext, typeInfo)
+
+
         def result = ["test", "1", "2", "3"]
         def parameters = newParameters()
-                .typeInfo(ExecutionTypeInfo.newTypeInfo().type(fieldType))
+                .typeInfo(typeInfo)
                 .source(result)
+                .nonNullFieldValidator(nullableFieldValidator)
                 .fields(["fld": []])
                 .build()
 
         when:
-        def executionResult = executionStrategy.completeValue(executionContext, parameters).join()
+        def executionResult = executionStrategy.completeValue(executionContext, parameters).fieldValue.join()
 
         then:
         executionResult.data == result
@@ -119,7 +135,8 @@ class ExecutionStrategyTest extends Specification {
         given:
         ExecutionContext executionContext = buildContext()
         def fieldType = GraphQLString
-        def typeInfo = ExecutionTypeInfo.newTypeInfo().type(fieldType).build()
+        def fldDef = newFieldDefinition().name("test").type(fieldType).build()
+        def typeInfo = ExecutionTypeInfo.newTypeInfo().type(fieldType).fieldDefinition(fldDef).build()
         NonNullableFieldValidator nullableFieldValidator = new NonNullableFieldValidator(executionContext, typeInfo)
         def parameters = newParameters()
                 .typeInfo(typeInfo)
@@ -129,7 +146,7 @@ class ExecutionStrategyTest extends Specification {
                 .build()
 
         when:
-        def executionResult = executionStrategy.completeValue(executionContext, parameters).join()
+        def executionResult = executionStrategy.completeValue(executionContext, parameters).fieldValue.join()
 
         then:
         executionResult.data == expected
@@ -144,7 +161,8 @@ class ExecutionStrategyTest extends Specification {
         given:
         ExecutionContext executionContext = buildContext()
         def fieldType = nonNull(GraphQLString)
-        def typeInfo = ExecutionTypeInfo.newTypeInfo().type(fieldType).build()
+        def fldDef = newFieldDefinition().name("test").type(fieldType).build()
+        def typeInfo = ExecutionTypeInfo.newTypeInfo().type(fieldType).fieldDefinition(fldDef).build()
         NonNullableFieldValidator nullableFieldValidator = new NonNullableFieldValidator(executionContext, typeInfo)
         def parameters = newParameters()
                 .typeInfo(typeInfo)
@@ -154,25 +172,174 @@ class ExecutionStrategyTest extends Specification {
                 .build()
 
         when:
-        executionStrategy.completeValue(executionContext, parameters).join()
+        executionStrategy.completeValue(executionContext, parameters).fieldValue.join()
 
         then:
-        thrown(NonNullableFieldWasNullException)
+        def e = thrown(CompletionException)
+        e.getCause() instanceof NonNullableFieldWasNullException
     }
 
-    def "completes value for an array"() {
+    def "completes value for java.util.OptionalInt"() {
         given:
         ExecutionContext executionContext = buildContext()
-        def fieldType = new GraphQLList(GraphQLString)
-        def result = ["test", "1", "2", "3"]
+        def fieldType = GraphQLString
+        def fldDef = newFieldDefinition().name("test").type(fieldType).build()
+        def typeInfo = ExecutionTypeInfo.newTypeInfo().type(fieldType).fieldDefinition(fldDef).build()
+        NonNullableFieldValidator nullableFieldValidator = new NonNullableFieldValidator(executionContext, typeInfo)
         def parameters = newParameters()
-                .typeInfo(ExecutionTypeInfo.newTypeInfo().type(fieldType))
+                .typeInfo(typeInfo)
+                .nonNullFieldValidator(nullableFieldValidator)
                 .source(result)
                 .fields(["fld": []])
                 .build()
 
         when:
-        def executionResult = executionStrategy.completeValue(executionContext, parameters).join()
+        def executionResult = executionStrategy.completeValue(executionContext, parameters).fieldValue.join()
+
+        then:
+        executionResult.data == expected
+
+        where:
+        result                    || expected
+        OptionalInt.of(10)      || "10"
+        OptionalInt.empty() || null
+    }
+
+    def "completes value for an empty java.util.OptionalInt that triggers non null exception"() {
+        given:
+        ExecutionContext executionContext = buildContext()
+        def fieldType = nonNull(GraphQLString)
+        def fldDef = newFieldDefinition().name("test").type(fieldType).build()
+        def typeInfo = ExecutionTypeInfo.newTypeInfo().type(fieldType).fieldDefinition(fldDef).build()
+        NonNullableFieldValidator nullableFieldValidator = new NonNullableFieldValidator(executionContext, typeInfo)
+        def parameters = newParameters()
+                .typeInfo(typeInfo)
+                .nonNullFieldValidator(nullableFieldValidator)
+                .source(OptionalInt.empty())
+                .fields(["fld": []])
+                .build()
+
+        when:
+        executionStrategy.completeValue(executionContext, parameters).fieldValue.join()
+
+        then:
+        def e = thrown(CompletionException)
+        e.getCause() instanceof NonNullableFieldWasNullException
+    }
+
+    def "completes value for java.util.OptionalDouble"() {
+        given:
+        ExecutionContext executionContext = buildContext()
+        def fieldType = GraphQLString
+        def fldDef = newFieldDefinition().name("test").type(fieldType).build()
+        def typeInfo = ExecutionTypeInfo.newTypeInfo().type(fieldType).fieldDefinition(fldDef).build()
+        NonNullableFieldValidator nullableFieldValidator = new NonNullableFieldValidator(executionContext, typeInfo)
+        def parameters = newParameters()
+                .typeInfo(typeInfo)
+                .nonNullFieldValidator(nullableFieldValidator)
+                .source(result)
+                .fields(["fld": []])
+                .build()
+
+        when:
+        def executionResult = executionStrategy.completeValue(executionContext, parameters).fieldValue.join()
+
+        then:
+        executionResult.data == expected
+
+        where:
+        result                    || expected
+        OptionalDouble.of(10)      || "10.0"
+        OptionalDouble.empty() || null
+    }
+
+    def "completes value for an empty java.util.OptionalDouble that triggers non null exception"() {
+        given:
+        ExecutionContext executionContext = buildContext()
+        def fieldType = nonNull(GraphQLString)
+        def fldDef = newFieldDefinition().name("test").type(fieldType).build()
+        def typeInfo = ExecutionTypeInfo.newTypeInfo().type(fieldType).fieldDefinition(fldDef).build()
+        NonNullableFieldValidator nullableFieldValidator = new NonNullableFieldValidator(executionContext, typeInfo)
+        def parameters = newParameters()
+                .typeInfo(typeInfo)
+                .nonNullFieldValidator(nullableFieldValidator)
+                .source(OptionalDouble.empty())
+                .fields(["fld": []])
+                .build()
+
+        when:
+        executionStrategy.completeValue(executionContext, parameters).fieldValue.join()
+
+        then:
+        def e = thrown(CompletionException)
+        e.getCause() instanceof NonNullableFieldWasNullException
+    }
+
+    def "completes value for java.util.OptionalLong"() {
+        given:
+        ExecutionContext executionContext = buildContext()
+        def fieldType = GraphQLString
+        def fldDef = newFieldDefinition().name("test").type(fieldType).build()
+        def typeInfo = ExecutionTypeInfo.newTypeInfo().type(fieldType).fieldDefinition(fldDef).build()
+        NonNullableFieldValidator nullableFieldValidator = new NonNullableFieldValidator(executionContext, typeInfo)
+        def parameters = newParameters()
+                .typeInfo(typeInfo)
+                .nonNullFieldValidator(nullableFieldValidator)
+                .source(result)
+                .fields(["fld": []])
+                .build()
+
+        when:
+        def executionResult = executionStrategy.completeValue(executionContext, parameters).fieldValue.join()
+
+        then:
+        executionResult.data == expected
+
+        where:
+        result                    || expected
+        OptionalLong.of(10)      || "10"
+        OptionalLong.empty() || null
+    }
+
+    def "completes value for an empty java.util.OptionalLong that triggers non null exception"() {
+        given:
+        ExecutionContext executionContext = buildContext()
+        def fieldType = nonNull(GraphQLString)
+        def fldDef = newFieldDefinition().name("test").type(fieldType).build()
+        def typeInfo = ExecutionTypeInfo.newTypeInfo().type(fieldType).fieldDefinition(fldDef).build()
+        NonNullableFieldValidator nullableFieldValidator = new NonNullableFieldValidator(executionContext, typeInfo)
+        def parameters = newParameters()
+                .typeInfo(typeInfo)
+                .nonNullFieldValidator(nullableFieldValidator)
+                .source(OptionalLong.empty())
+                .fields(["fld": []])
+                .build()
+
+        when:
+        executionStrategy.completeValue(executionContext, parameters).fieldValue.join()
+
+        then:
+        def e = thrown(CompletionException)
+        e.getCause() instanceof NonNullableFieldWasNullException
+    }
+
+    def "completes value for an array"() {
+        given:
+        ExecutionContext executionContext = buildContext()
+        def fieldType = list(GraphQLString)
+        def fldDef = newFieldDefinition().name("test").type(fieldType).build()
+        def typeInfo = ExecutionTypeInfo.newTypeInfo().type(fieldType).fieldDefinition(fldDef).build()
+        NonNullableFieldValidator nullableFieldValidator = new NonNullableFieldValidator(executionContext, typeInfo)
+        def result = ["test", "1", "2", "3"]
+        def parameters = newParameters()
+                .typeInfo(typeInfo)
+                .source(result)
+                .nonNullFieldValidator(nullableFieldValidator)
+                .fields(["fld": []])
+                .build()
+
+        when:
+        def executionResult = executionStrategy.completeValue(executionContext, parameters).fieldValue.join()
 
         then:
         executionResult.data == result
@@ -194,7 +361,7 @@ class ExecutionStrategyTest extends Specification {
                 .build()
 
         when:
-        def executionResult = executionStrategy.completeValue(executionContext, parameters).join()
+        def executionResult = executionStrategy.completeValue(executionContext, parameters).fieldValue.join()
 
         then:
         executionResult.data == null
@@ -219,7 +386,7 @@ class ExecutionStrategyTest extends Specification {
                 .build()
 
         when:
-        def executionResult = executionStrategy.completeValue(executionContext, parameters).join()
+        def executionResult = executionStrategy.completeValue(executionContext, parameters).fieldValue.join()
 
         then:
         executionResult.data == null
@@ -358,8 +525,7 @@ class ExecutionStrategyTest extends Specification {
         ExecutionPath expectedPath = ExecutionPath.rootPath().segment("someField")
 
         SourceLocation sourceLocation = new SourceLocation(666, 999)
-        Field field = new Field("someField")
-        field.setSourceLocation(sourceLocation)
+        Field field = Field.newField("someField").sourceLocation(sourceLocation).build()
         def parameters = newParameters()
                 .typeInfo(typeInfo)
                 .source("source")
@@ -479,6 +645,133 @@ class ExecutionStrategyTest extends Specification {
         thrown(CompletionException)
         executionContext.errors.size() == 1 // only 1 error
         executionContext.errors[0] instanceof ExceptionWhileDataFetching
+    }
 
+    def "#163 completes value for an primitive type array"() {
+        given:
+        ExecutionContext executionContext = buildContext()
+        long[] result = [1L, 2L, 3L]
+        def fieldType = list(Scalars.GraphQLLong)
+        def fldDef = newFieldDefinition().name("test").type(fieldType).build()
+        def typeInfo = ExecutionTypeInfo.newTypeInfo().type(fieldType).fieldDefinition(fldDef).build()
+        NonNullableFieldValidator nullableFieldValidator = new NonNullableFieldValidator(executionContext, typeInfo)
+
+        def parameters = newParameters()
+                .typeInfo(typeInfo)
+                .source(result)
+                .nonNullFieldValidator(nullableFieldValidator)
+                .fields(["fld": [Field.newField().build()]])
+                .field([Field.newField().build()])
+                .build()
+
+        when:
+        def executionResult = executionStrategy.completeValue(executionContext, parameters).fieldValue
+
+        then:
+        executionResult.get().data == [1L, 2L, 3L]
+    }
+
+    def "#820 processes DataFetcherResult"() {
+        given:
+
+        ExecutionContext executionContext = buildContext()
+        def fieldType = list(Scalars.GraphQLLong)
+        def fldDef = newFieldDefinition().name("test").type(fieldType).build()
+        def typeInfo = ExecutionTypeInfo.newTypeInfo().type(fieldType).fieldDefinition(fldDef).build()
+        def field = Field.newField("parent").sourceLocation(new SourceLocation(5, 10)).build()
+        def parameters = newParameters()
+            .path(ExecutionPath.fromList(["parent"]))
+            .field([field])
+            .fields(["parent":[field]])
+            .typeInfo(typeInfo)
+            .build()
+
+        def executionData = ["child": [:]]
+        when:
+        def executionResult = executionStrategy.unboxPossibleDataFetcherResult(executionContext, parameters,
+                new DataFetcherResult(executionData, [new DataFetchingErrorGraphQLError("bad foo", ["child", "foo"])]))
+
+        then:
+        executionResult == executionData
+        executionContext.getErrors()[0].locations == [new SourceLocation(7, 20)]
+        executionContext.getErrors()[0].message == "bad foo"
+        executionContext.getErrors()[0].path == ["parent", "child", "foo"]
+    }
+
+    def "#820 processes DataFetcherResult just message"() {
+        given:
+
+        ExecutionContext executionContext = buildContext()
+        def fieldType = list(Scalars.GraphQLLong)
+        def fldDef = newFieldDefinition().name("test").type(fieldType).build()
+        def typeInfo = ExecutionTypeInfo.newTypeInfo().type(fieldType).fieldDefinition(fldDef).build()
+        def field = Field.newField("parent").sourceLocation(new SourceLocation(5, 10)).build()
+        def parameters = newParameters()
+                .path(ExecutionPath.fromList(["parent"]))
+                .field([field])
+                .fields(["parent":[field]])
+                .typeInfo(typeInfo)
+                .build()
+
+        def executionData = ["child": [:]]
+        when:
+        def executionResult = executionStrategy.unboxPossibleDataFetcherResult(executionContext, parameters,
+                new DataFetcherResult(executionData, [new DataFetchingErrorGraphQLError("bad foo")]))
+
+        then:
+        executionResult == executionData
+        executionContext.getErrors()[0].locations == null
+        executionContext.getErrors()[0].message == "bad foo"
+        executionContext.getErrors()[0].path == null
+    }
+
+    def "completes value for an iterable"() {
+        given:
+        ExecutionContext executionContext = buildContext()
+        List<Long> result = [1L, 2L, 3L]
+        def fieldType = list(Scalars.GraphQLLong)
+        def fldDef = newFieldDefinition().name("test").type(fieldType).build()
+        def typeInfo = ExecutionTypeInfo.newTypeInfo().type(fieldType).fieldDefinition(fldDef).build()
+        NonNullableFieldValidator nullableFieldValidator = new NonNullableFieldValidator(executionContext, typeInfo)
+
+        def parameters = newParameters()
+                .typeInfo(typeInfo)
+                .source(result)
+                .nonNullFieldValidator(nullableFieldValidator)
+                .fields(["fld": [Field.newField().build()]])
+                .field([Field.newField().build()])
+                .build()
+
+        when:
+        def executionResult = executionStrategy.completeValue(executionContext, parameters).fieldValue
+
+        then:
+        executionResult.get().data == [1L, 2L, 3L]
+    }
+
+    def "when completeValue expects GraphQLList and non iterable or non array is passed then it should yield a TypeMismatch error"() {
+        given:
+        ExecutionContext executionContext = buildContext()
+        Map<String, Object> result = new HashMap<>()
+        def fieldType = list(Scalars.GraphQLLong)
+        def fldDef = newFieldDefinition().name("test").type(fieldType).build()
+        def typeInfo = ExecutionTypeInfo.newTypeInfo().type(fieldType).fieldDefinition(fldDef).build()
+        NonNullableFieldValidator nullableFieldValidator = new NonNullableFieldValidator(executionContext, typeInfo)
+
+        def parameters = newParameters()
+                .typeInfo(typeInfo)
+                .source(result)
+                .nonNullFieldValidator(nullableFieldValidator)
+                .fields(["fld": [Field.newField().build()]])
+                .field([Field.newField().build()])
+                .build()
+
+        when:
+        def executionResult = executionStrategy.completeValue(executionContext, parameters).fieldValue.join()
+
+        then:
+        executionResult.data == null
+        executionContext.errors.size() == 1
+        executionContext.errors[0] instanceof TypeMismatchError
     }
 }

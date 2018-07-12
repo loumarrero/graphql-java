@@ -2,6 +2,7 @@ package graphql.schema.idl;
 
 import graphql.GraphQLError;
 import graphql.InvalidSyntaxError;
+import graphql.PublicApi;
 import graphql.language.Definition;
 import graphql.language.Document;
 import graphql.parser.Parser;
@@ -9,19 +10,21 @@ import graphql.schema.idl.errors.SchemaProblem;
 import org.antlr.v4.runtime.misc.ParseCancellationException;
 
 import java.io.File;
-import java.io.FileNotFoundException;
-import java.io.FileReader;
 import java.io.IOException;
 import java.io.Reader;
 import java.io.StringWriter;
+import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+
+import static java.nio.charset.Charset.defaultCharset;
 
 /**
  * This can take a graphql schema definition and parse it into a {@link TypeDefinitionRegistry} of
  * definitions ready to be placed into {@link SchemaGenerator} say
  */
+@PublicApi
 public class SchemaParser {
 
     /**
@@ -35,8 +38,8 @@ public class SchemaParser {
      */
     public TypeDefinitionRegistry parse(File file) throws SchemaProblem {
         try {
-            return parse(new FileReader(file));
-        } catch (FileNotFoundException e) {
+            return parse(Files.newBufferedReader(file.toPath(), defaultCharset()));
+        } catch (IOException e) {
             throw new RuntimeException(e);
         }
     }
